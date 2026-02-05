@@ -58,136 +58,135 @@
 /*
  * Per-user equitable CPU allocation (Task 2B)
  *
- * Track runnable task weight sum per user and scale vruntime increments
- * based on the ratio of user's total weight to task's individual weight.
- * This ensures each user gets approximately equal CPU time while
- * preserving nice value semantics within each user.
+ * Track per-user task counts and scale vruntime to ensure each user
+ * gets approximately equal CPU time regardless of how many tasks they run.
+ * Only applies when UID >= 1000 and there is CPU contention.
  */
 #define USER_FAIR_MIN_UID 1000
-#define USER_FAIR_MAX_USERS 256
+#define USER_FAIR_MAX_USERS 64
 
 struct user_fair_stats {
 	uid_t uid;
-	int runnable_count;
-	unsigned long weight_sum;	/* Sum of weights of all runnable tasks */
+	int task_count;      /* Number of runnable tasks for this user */
 };
 
 static struct user_fair_stats user_fair_table[USER_FAIR_MAX_USERS];
-static int user_fair_num_users;
-static int user_fair_total_runnable;
+static int user_fair_count;
 static DEFINE_RAW_SPINLOCK(user_fair_lock);
 
 static struct user_fair_stats *user_fair_find(uid_t uid)
 {
 	int i;
-
-	for (i = 0; i < user_fair_num_users; i++) {
+	for (i = 0; i < user_fair_count; i++) {
 		if (user_fair_table[i].uid == uid)
 			return &user_fair_table[i];
 	}
 	return NULL;
 }
 
-static struct user_fair_stats *user_fair_find_or_create(uid_t uid)
+static struct user_fair_stats *user_fair_get(uid_t uid)
 {
-	struct user_fair_stats *us;
-
-	us = user_fair_find(uid);
+	struct user_fair_stats *us = user_fair_find(uid);
 	if (us)
 		return us;
-
-	if (user_fair_num_users >= USER_FAIR_MAX_USERS)
+	if (user_fair_count >= USER_FAIR_MAX_USERS)
 		return NULL;
-
-	us = &user_fair_table[user_fair_num_users++];
+	us = &user_fair_table[user_fair_count++];
 	us->uid = uid;
-	us->runnable_count = 0;
-	us->weight_sum = 0;
+	us->task_count = 0;
 	return us;
 }
 
-static void user_fair_enqueue(struct task_struct *p)
+/* Called when a task becomes runnable */
+static void user_fair_inc(struct task_struct *p)
 {
 	struct user_fair_stats *us;
 	uid_t uid;
 	unsigned long flags;
-	unsigned long weight;
 
 	uid = __kuid_val(task_uid(p));
 	if (uid < USER_FAIR_MIN_UID)
 		return;
 
-	weight = p->se.load.weight;
-
 	raw_spin_lock_irqsave(&user_fair_lock, flags);
-	us = user_fair_find_or_create(uid);
-	if (us) {
-		us->runnable_count++;
-		us->weight_sum += weight;
-		user_fair_total_runnable++;
-	}
+	us = user_fair_get(uid);
+	if (us)
+		us->task_count++;
 	raw_spin_unlock_irqrestore(&user_fair_lock, flags);
 }
 
-static void user_fair_dequeue(struct task_struct *p)
+/* Called when a task stops being runnable */
+static void user_fair_dec(struct task_struct *p)
 {
 	struct user_fair_stats *us;
 	uid_t uid;
 	unsigned long flags;
-	unsigned long weight;
 
 	uid = __kuid_val(task_uid(p));
 	if (uid < USER_FAIR_MIN_UID)
 		return;
 
-	weight = p->se.load.weight;
-
 	raw_spin_lock_irqsave(&user_fair_lock, flags);
 	us = user_fair_find(uid);
-	if (us && us->runnable_count > 0) {
-		us->runnable_count--;
-		if (us->weight_sum >= weight)
-			us->weight_sum -= weight;
-		else
-			us->weight_sum = 0;
-		if (user_fair_total_runnable > 0)
-			user_fair_total_runnable--;
-	}
+	if (us && us->task_count > 0)
+		us->task_count--;
 	raw_spin_unlock_irqrestore(&user_fair_lock, flags);
 }
 
 /*
- * Get the user's total weight sum for vruntime scaling.
- * Returns 0 if no scaling should be applied (system user or no contention).
+ * Get vruntime scale factor for per-user fairness.
+ * Returns scale * 1024, where scale = user_tasks * num_users.
+ * This ensures all users have their vruntime scaled proportionally,
+ * achieving true per-user CPU fairness.
+ * Returns 0 if no scaling should be applied.
  */
-static unsigned long user_fair_get_weight_sum(uid_t uid)
+static unsigned long user_fair_get_scale(struct task_struct *p)
 {
 	struct user_fair_stats *us;
-	unsigned long weight_sum = 0;
-	int total;
+	uid_t uid;
 	unsigned long flags;
+	unsigned long scale = 0;
+	int active_users = 0;
+	int total_tasks = 0;
+	int user_tasks = 0;
+	int i;
 
+	uid = __kuid_val(task_uid(p));
 	if (uid < USER_FAIR_MIN_UID)
 		return 0;
 
 	raw_spin_lock_irqsave(&user_fair_lock, flags);
 
-	/*
-	 * Only apply per-user fairness when there's actual CPU contention.
-	 * If total runnable tasks <= number of CPUs, no scaling needed.
-	 */
-	total = user_fair_total_runnable;
-	if (total <= num_online_cpus()) {
-		raw_spin_unlock_irqrestore(&user_fair_lock, flags);
-		return 0;
+	/* Count active users and total tasks */
+	for (i = 0; i < user_fair_count; i++) {
+		if (user_fair_table[i].task_count > 0) {
+			active_users++;
+			total_tasks += user_fair_table[i].task_count;
+		}
 	}
 
+	/* Get this user's task count */
 	us = user_fair_find(uid);
-	if (us && us->runnable_count > 0)
-		weight_sum = us->weight_sum;
-	raw_spin_unlock_irqrestore(&user_fair_lock, flags);
+	if (us)
+		user_tasks = us->task_count;
 
-	return weight_sum;
+	/*
+	 * Only apply fairness when:
+	 * - More than one active user with UID >= 1000
+	 * - Total runnable tasks > number of CPUs (contention)
+	 */
+	if (active_users > 1 && total_tasks > num_online_cpus() && user_tasks > 0) {
+		/*
+		 * Scale = user_tasks * active_users * 1024
+		 * This makes vruntime grow faster for users with more tasks,
+		 * proportional to how much over their fair share they are.
+		 * Using *1024 for fixed-point precision.
+		 */
+		scale = (unsigned long)user_tasks * active_users * 1024UL;
+	}
+
+	raw_spin_unlock_irqrestore(&user_fair_lock, flags);
+	return scale;
 }
 
 /*
@@ -1342,9 +1341,6 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	struct rq *rq = rq_of(cfs_rq);
 	s64 delta_exec;
 	bool resched;
-	u64 vruntime_delta;
-	unsigned long user_weight_sum;
-	unsigned long task_weight;
 
 	if (unlikely(!curr))
 		return;
@@ -1353,36 +1349,22 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (unlikely(delta_exec <= 0))
 		return;
 
-	vruntime_delta = calc_delta_fair(delta_exec, curr);
-
 	/*
-	 * Per-user equitable scheduling: scale vruntime by the ratio of
-	 * user's total weight to this task's weight. This ensures:
-	 * 1. Users with more runnable tasks have their vruntime advance faster
-	 * 2. Nice values are preserved within each user (higher priority
-	 *    tasks within the same user still get more CPU)
-	 * 3. Each user gets approximately equal CPU time regardless of
-	 *    how many processes they run
+	 * Per-user equitable scheduling (Task 2B):
+	 * Scale vruntime by user_tasks * num_users to ensure users with more
+	 * tasks have their vruntime advance faster, giving each user equal
+	 * CPU time regardless of how many tasks they run.
 	 */
-	if (entity_is_task(curr)) {
-		struct task_struct *p = task_of(curr);
-		uid_t uid = __kuid_val(task_uid(p));
-
-		user_weight_sum = user_fair_get_weight_sum(uid);
-		task_weight = curr->load.weight;
-
-		/*
-		 * Scale vruntime by (user_weight_sum / task_weight).
-		 * Only scale if user_weight_sum > task_weight (meaning user
-		 * has other runnable tasks contributing to the weight sum).
-		 * No cap is applied - this ensures true per-user equitable
-		 * CPU allocation regardless of how many processes a user runs.
-		 */
-		if (user_weight_sum > task_weight && task_weight > 0)
-			vruntime_delta = vruntime_delta * user_weight_sum / task_weight;
+	{
+		u64 vruntime_delta = calc_delta_fair(delta_exec, curr);
+		if (entity_is_task(curr)) {
+			struct task_struct *p = task_of(curr);
+			unsigned long scale = user_fair_get_scale(p);
+			if (scale > 1024)
+				vruntime_delta = vruntime_delta * scale / 1024;
+		}
+		curr->vruntime += vruntime_delta;
 	}
-
-	curr->vruntime += vruntime_delta;
 	resched = update_deadline(cfs_rq, curr);
 
 	if (entity_is_task(curr)) {
@@ -7178,18 +7160,18 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & ENQUEUE_RESTORE))))
 		util_est_enqueue(&rq->cfs, p);
 
+	/*
+	 * Per-user equitable scheduling (Task 2B):
+	 * Track when tasks become runnable. Count new tasks and tasks
+	 * waking from sleep, but not migrations or delayed tasks.
+	 */
+	if ((task_new || (flags & ENQUEUE_WAKEUP)) && !(flags & ENQUEUE_MIGRATING))
+		user_fair_inc(p);
+
 	if (flags & ENQUEUE_DELAYED) {
 		requeue_delayed_entity(se);
 		return;
 	}
-
-	/*
-	 * Track per-user runnable count for equitable scheduling.
-	 * Count when task is newly forked or waking from sleep,
-	 * but not when being migrated between CPUs.
-	 */
-	if ((task_new || (flags & ENQUEUE_WAKEUP)) && !(flags & ENQUEUE_RESTORE))
-		user_fair_enqueue(p);
 
 	/*
 	 * If in_iowait is set, the code below may not trigger any cpufreq
@@ -7434,15 +7416,16 @@ out:
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	/*
+	 * Per-user equitable scheduling (Task 2B):
+	 * Track when tasks stop being runnable. Only decrement for tasks
+	 * going to sleep, not for migrations.
+	 */
+	if ((flags & DEQUEUE_SLEEP) && !(flags & DEQUEUE_MIGRATING))
+		user_fair_dec(p);
+
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & DEQUEUE_SAVE))))
 		util_est_dequeue(&rq->cfs, p);
-
-	/*
-	 * Track per-user runnable count for equitable scheduling.
-	 * Decrement when task goes to sleep (not migration).
-	 */
-	if ((flags & DEQUEUE_SLEEP) && !(flags & DEQUEUE_SAVE))
-		user_fair_dequeue(p);
 
 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
 	if (dequeue_entities(rq, &p->se, flags) < 0)

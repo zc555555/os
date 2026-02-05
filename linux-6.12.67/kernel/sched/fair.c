@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Completely Fair Scheduling (CFS) Class (SCHED_NORMAL/SCHED_BATCH)
@@ -129,14 +130,17 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 #endif
 
-/* Entangled CPU pair for cross-CPU mutual exclusion */
-static unsigned int sysctl_entangled_cpu1;
-static unsigned int sysctl_entangled_cpu2;
+/* Entangled CPU pair for cross-CPU mutual exclusion (Task 1) */
+static unsigned int sysctl_entangled_cpu1 = 0;
+static unsigned int sysctl_entangled_cpu2 = 0;
 
-/* Timeout to prevent starvation (10 seconds) */
+/*
+ * Track when blocking started for each entangled CPU due to the constraint.
+ * If a CPU is blocked for more than 10 seconds, we must allow tasks to run.
+ * Index 0 = entangled_cpu1, Index 1 = entangled_cpu2
+ */
 #define ENTANGLED_TIMEOUT_SECS 10
-static unsigned long entangled_block_start_jiffies;
-static bool entangled_timeout_active;
+static unsigned long entangled_block_start_jiffies[2];
 
 #ifdef CONFIG_SYSCTL
 static struct ctl_table sched_fair_sysctls[] = {
@@ -8949,67 +8953,96 @@ preempt:
 }
 
 /*
- * check_entangled_cpu_constraint - enforce mutual exclusion on entangled CPUs
- * @rq: runqueue of the current CPU
- * @p: task to be scheduled
+ * Check if a task can be scheduled on this CPU based on entangled CPU constraints.
+ * Returns true if the task can run, false if it violates the entanglement constraint.
  *
- * If CPUs X and Y are entangled, processes from different users cannot
- * run simultaneously on both CPUs. Returns true if task can run.
+ * The constraint: If CPU X and CPU Y are entangled, and a process from user A
+ * is running on CPU X, then only processes from user A can run on CPU Y.
+ *
+ * Additional: No CPU should be idle for more than 10 seconds while tasks are waiting.
  */
 static bool check_entangled_cpu_constraint(struct rq *rq, struct task_struct *p)
 {
 	unsigned int cpu1, cpu2, this_cpu, other_cpu;
 	struct task_struct *other_task;
 	uid_t this_uid, other_uid;
+	int idx;
 	unsigned long block_start, now;
 
+	/* Read the entangled CPU pair */
 	cpu1 = READ_ONCE(sysctl_entangled_cpu1);
 	cpu2 = READ_ONCE(sysctl_entangled_cpu2);
 
+	/* If both are the same, no entanglement is configured */
 	if (cpu1 == cpu2)
-		return true;
-
-	/* Validate CPU IDs */
-	if (cpu1 >= nr_cpu_ids || cpu2 >= nr_cpu_ids)
-		return true;
-	if (!cpu_online(cpu1) || !cpu_online(cpu2))
 		return true;
 
 	this_cpu = cpu_of(rq);
 
-	if (this_cpu == cpu1)
+	/* Check if this CPU is one of the entangled pair */
+	if (this_cpu == cpu1) {
 		other_cpu = cpu2;
-	else if (this_cpu == cpu2)
+		idx = 0;  /* Index for cpu1's block timer */
+	} else if (this_cpu == cpu2) {
 		other_cpu = cpu1;
-	else
-		return true;
+		idx = 1;  /* Index for cpu2's block timer */
+	} else {
+		return true; /* This CPU is not entangled */
+	}
 
+	/* Get the task currently running on the other entangled CPU */
 	other_task = cpu_rq(other_cpu)->curr;
+
+	/* If other CPU is idle (running the idle task), allow any task */
+	/* Note: Don't reset the block timer here - only reset when constraint is satisfied */
 	if (!other_task || other_task->pid == 0)
 		return true;
 
+	/* Compare user IDs */
 	this_uid = __kuid_val(task_uid(p));
 	other_uid = __kuid_val(task_uid(other_task));
 
-	if (this_uid == other_uid)
+	/* Same user - allow and reset block timer */
+	if (this_uid == other_uid) {
+		entangled_block_start_jiffies[idx] = 0;
 		return true;
+	}
 
-	if (READ_ONCE(entangled_timeout_active))
-		return true;
-
+	/*
+	 * Different user - would normally block.
+	 * Check if we've been blocking for more than 10 seconds.
+	 */
 	now = jiffies;
-	block_start = READ_ONCE(entangled_block_start_jiffies);
+	block_start = READ_ONCE(entangled_block_start_jiffies[idx]);
 
 	if (block_start == 0) {
-		WRITE_ONCE(entangled_block_start_jiffies, now);
-		return false;
+		/* First time blocking, record start time */
+		WRITE_ONCE(entangled_block_start_jiffies[idx], now);
+		printk_ratelimited(KERN_INFO "entangled: CPU%u blocked, start=%lu now=%lu HZ=%d\n",
+			this_cpu, now, now, HZ);
+		return false;  /* Block the task */
 	}
 
+	/* Check if 10 seconds have passed since we started blocking */
 	if (time_after(now, block_start + ENTANGLED_TIMEOUT_SECS * HZ)) {
-		WRITE_ONCE(entangled_timeout_active, true);
+		/*
+		 * Timeout - allow the task to prevent starvation.
+		 * DON'T reset the timer here! Keep allowing until the constraint
+		 * is naturally satisfied (same user on other CPU or other CPU idle).
+		 * The timer will be reset when that happens.
+		 */
+		printk_ratelimited(KERN_INFO "entangled: CPU%u TIMEOUT! start=%lu now=%lu diff=%lu\n",
+			this_cpu, block_start, now, now - block_start);
 		return true;
 	}
 
+	/* Debug: print every ~5 seconds while blocking */
+	if ((now - block_start) % (5 * HZ) < 10) {
+		printk_ratelimited(KERN_INFO "entangled: CPU%u still blocked, elapsed=%lu ticks\n",
+			this_cpu, now - block_start);
+	}
+
+	/* Still within timeout window, continue blocking */
 	return false;
 }
 
@@ -9040,6 +9073,7 @@ again:
 
 	p = task_of(se);
 
+	/* Check entangled CPU constraint */
 	if (!check_entangled_cpu_constraint(rq, p))
 		return NULL;
 
