@@ -9194,12 +9194,26 @@ again:
 		}
 	}
 
-	/* No alternative found. Start retry timer. */
+	/*
+	 * No alternative found. Notify the partner CPU that we're going
+	 * idle - it may now be able to run (e.g., if it was waiting for
+	 * us to stop). This replaces the old 1ms hrtimer polling which
+	 * caused RCU stalls by preventing proper quiescent states.
+	 */
 	{
-		struct hrtimer *timer = this_cpu_ptr(&entangled_retry_timer);
-		if (!hrtimer_active(timer))
-			hrtimer_start(timer, ns_to_ktime(ENTANGLED_RETRY_NS),
-				      HRTIMER_MODE_REL_PINNED);
+		unsigned int ec1 = READ_ONCE(sysctl_entangled_cpu1);
+		unsigned int ec2 = READ_ONCE(sysctl_entangled_cpu2);
+		unsigned int this_cpu = cpu_of(rq);
+
+		if (ec1 != ec2) {
+			unsigned int other_cpu;
+
+			if (this_cpu == ec1)
+				other_cpu = ec2;
+			else
+				other_cpu = ec1;
+			wake_up_nohz_cpu(other_cpu);
+		}
 	}
 	return NULL;
 }
