@@ -142,6 +142,47 @@ static unsigned int sysctl_entangled_cpu2 = 0;
 #define ENTANGLED_TIMEOUT_SECS 10
 static unsigned long entangled_block_start_jiffies[2];
 
+/*
+ * Track whether each entangled CPU has a task waiting to run but blocked
+ * by the entanglement constraint. Used to coordinate yielding between CPUs.
+ */
+static bool entangled_wants_to_run[2];
+
+/*
+ * Turn-based coordination for entangled CPUs.
+ * entangled_active_cpu: CPU number that currently has permission to run
+ *   user tasks. -1 means no active conflict (no turn assigned).
+ * entangled_turn_start: jiffies timestamp when the current turn began.
+ * ENTANGLED_TURN_JIFFIES: duration of each turn (1 second).
+ */
+static int entangled_active_cpu = -1;
+static unsigned long entangled_turn_start;
+#define ENTANGLED_TURN_JIFFIES (HZ)
+
+/*
+ * Per-CPU hrtimer for retrying scheduling on blocked entangled CPUs.
+ * When pick_task_fair blocks a task due to entanglement, it starts this
+ * timer (1ms). The timer fires in IRQ context, sets TIF_NEED_RESCHED on
+ * the idle task, causing the idle loop to call schedule() and retry.
+ * This is needed because __schedule() clears TIF_NEED_RESCHED, so we
+ * cannot simply set it in pick_task_fair.
+ */
+static DEFINE_PER_CPU(struct hrtimer, entangled_retry_timer);
+#define ENTANGLED_RETRY_NS (NSEC_PER_MSEC)  /* 1ms retry interval */
+
+static enum hrtimer_restart entangled_retry_fn(struct hrtimer *timer)
+{
+	unsigned int cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	unsigned int cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+	unsigned int this_cpu = smp_processor_id();
+
+	/* Only trigger resched if this CPU is still entangled */
+	if (cpu1 != cpu2 && (this_cpu == cpu1 || this_cpu == cpu2))
+		set_tsk_need_resched(current);
+
+	return HRTIMER_NORESTART;
+}
+
 #ifdef CONFIG_SYSCTL
 static struct ctl_table sched_fair_sysctls[] = {
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -8959,15 +9000,21 @@ preempt:
  * The constraint: If CPU X and CPU Y are entangled, and a process from user A
  * is running on CPU X, then only processes from user A can run on CPU Y.
  *
- * Additional: No CPU should be idle for more than 10 seconds while tasks are waiting.
+ * Turn-based coordination: entangled_active_cpu tracks which CPU currently has
+ * permission to run user tasks. The active CPU's tick handler switches turns
+ * after ENTANGLED_TURN_JIFFIES (1 second). The blocked CPU busy-loops on idle
+ * (via set_tsk_need_resched in pick_task_fair) until the turn changes.
+ *
+ * Safety: No CPU should be blocked for more than 10 seconds (starvation timeout).
  */
 static bool check_entangled_cpu_constraint(struct rq *rq, struct task_struct *p)
 {
 	unsigned int cpu1, cpu2, this_cpu, other_cpu;
 	struct task_struct *other_task;
 	uid_t this_uid, other_uid;
-	int idx;
+	int idx, other_idx;
 	unsigned long block_start, now;
+	int active;
 
 	/* Read the entangled CPU pair */
 	cpu1 = READ_ONCE(sysctl_entangled_cpu1);
@@ -8982,67 +9029,104 @@ static bool check_entangled_cpu_constraint(struct rq *rq, struct task_struct *p)
 	/* Check if this CPU is one of the entangled pair */
 	if (this_cpu == cpu1) {
 		other_cpu = cpu2;
-		idx = 0;  /* Index for cpu1's block timer */
+		idx = 0;
+		other_idx = 1;
 	} else if (this_cpu == cpu2) {
 		other_cpu = cpu1;
-		idx = 1;  /* Index for cpu2's block timer */
+		idx = 1;
+		other_idx = 0;
 	} else {
 		return true; /* This CPU is not entangled */
 	}
 
-	/* Get the task currently running on the other entangled CPU */
-	other_task = cpu_rq(other_cpu)->curr;
+	/*
+	 * Reset stale state if the entangled CPU pair has changed.
+	 * The active_cpu must be one of the current pair or -1.
+	 */
+	active = READ_ONCE(entangled_active_cpu);
+	if (active != -1 && active != (int)cpu1 && active != (int)cpu2) {
+		WRITE_ONCE(entangled_active_cpu, -1);
+		WRITE_ONCE(entangled_wants_to_run[0], false);
+		WRITE_ONCE(entangled_wants_to_run[1], false);
+		WRITE_ONCE(entangled_block_start_jiffies[0], 0);
+		WRITE_ONCE(entangled_block_start_jiffies[1], 0);
+	}
 
-	/* If other CPU is idle (running the idle task), allow any task */
-	/* Note: Don't reset the block timer here - only reset when constraint is satisfied */
-	if (!other_task || other_task->pid == 0)
+	/* Skip kernel threads and idle task - they don't violate the constraint */
+	if (p->pid == 0 || !p->mm)
 		return true;
 
-	/* Compare user IDs */
 	this_uid = __kuid_val(task_uid(p));
+	other_task = READ_ONCE(cpu_rq(other_cpu)->curr);
+
+	/* If other CPU is idle or running a kernel thread */
+	if (!other_task || other_task->pid == 0 || !other_task->mm) {
+		active = READ_ONCE(entangled_active_cpu);
+
+		/*
+		 * If it's the other CPU's turn, block ourselves as long as
+		 * the other CPU has runnable CFS tasks. We check nr_running
+		 * instead of just wants_to_run because the other CPU may
+		 * briefly run kernel threads (kworker) between user tasks,
+		 * and we must not clear our state during those transitions.
+		 */
+		if (active == (int)other_cpu &&
+		    cpu_rq(other_cpu)->cfs.nr_running > 0) {
+			WRITE_ONCE(entangled_wants_to_run[idx], true);
+			goto blocked;
+		}
+
+		/*
+		 * Either it's our turn, no turn is set, or the other CPU
+		 * has no runnable tasks (conflict over). Allow and clean up.
+		 */
+		if (active == (int)other_cpu)
+			WRITE_ONCE(entangled_active_cpu, -1);
+
+		WRITE_ONCE(entangled_wants_to_run[idx], false);
+		WRITE_ONCE(entangled_block_start_jiffies[idx], 0);
+		return true;
+	}
+
+	/* Other CPU is running a user task - compare UIDs */
 	other_uid = __kuid_val(task_uid(other_task));
 
-	/* Same user - allow and reset block timer */
+	/* Same user - allow */
 	if (this_uid == other_uid) {
-		entangled_block_start_jiffies[idx] = 0;
+		WRITE_ONCE(entangled_wants_to_run[idx], false);
+		WRITE_ONCE(entangled_block_start_jiffies[idx], 0);
 		return true;
 	}
 
 	/*
-	 * Different user - would normally block.
-	 * Check if we've been blocking for more than 10 seconds.
+	 * Different user on other CPU - conflict!
+	 * If no turn assigned yet, give the turn to the other CPU
+	 * (since they're already running).
 	 */
+	active = READ_ONCE(entangled_active_cpu);
+	if (active == -1) {
+		WRITE_ONCE(entangled_active_cpu, (int)other_cpu);
+		WRITE_ONCE(entangled_turn_start, jiffies);
+	}
+
+	WRITE_ONCE(entangled_wants_to_run[idx], true);
+
+blocked:
+	/* Starvation timeout: allow after 10 seconds of continuous blocking */
 	now = jiffies;
 	block_start = READ_ONCE(entangled_block_start_jiffies[idx]);
 
 	if (block_start == 0) {
-		/* First time blocking, record start time */
 		WRITE_ONCE(entangled_block_start_jiffies[idx], now);
-		printk_ratelimited(KERN_INFO "entangled: CPU%u blocked, start=%lu now=%lu HZ=%d\n",
-			this_cpu, now, now, HZ);
-		return false;  /* Block the task */
+		return false;
 	}
 
-	/* Check if 10 seconds have passed since we started blocking */
 	if (time_after(now, block_start + ENTANGLED_TIMEOUT_SECS * HZ)) {
-		/*
-		 * Timeout - allow the task to prevent starvation.
-		 * DON'T reset the timer here! Keep allowing until the constraint
-		 * is naturally satisfied (same user on other CPU or other CPU idle).
-		 * The timer will be reset when that happens.
-		 */
-		printk_ratelimited(KERN_INFO "entangled: CPU%u TIMEOUT! start=%lu now=%lu diff=%lu\n",
-			this_cpu, block_start, now, now - block_start);
+		/* Timeout - allow to prevent starvation */
+		WRITE_ONCE(entangled_wants_to_run[idx], false);
 		return true;
 	}
 
-	/* Debug: print every ~5 seconds while blocking */
-	if ((now - block_start) % (5 * HZ) < 10) {
-		printk_ratelimited(KERN_INFO "entangled: CPU%u still blocked, elapsed=%lu ticks\n",
-			this_cpu, now - block_start);
-	}
-
-	/* Still within timeout window, continue blocking */
 	return false;
 }
 
@@ -9074,10 +9158,50 @@ again:
 	p = task_of(se);
 
 	/* Check entangled CPU constraint */
-	if (!check_entangled_cpu_constraint(rq, p))
-		return NULL;
+	if (check_entangled_cpu_constraint(rq, p))
+		return p;
 
-	return p;
+	/*
+	 * Task blocked by entanglement. Walk all leaf cfs_rqs on this
+	 * CPU to find an alternative task from an allowed user.
+	 * This handles the case where multiple users have tasks pinned
+	 * to the same CPU (e.g. test 002).
+	 */
+	{
+		struct cfs_rq *leaf_cfs_rq, *pos;
+		struct rb_node *node;
+
+		for_each_leaf_cfs_rq_safe(rq, leaf_cfs_rq, pos) {
+			/* Check entities in the rb-tree */
+			node = rb_first_cached(&leaf_cfs_rq->tasks_timeline);
+			while (node) {
+				se = rb_entry(node, struct sched_entity,
+					      run_node);
+				if (!group_cfs_rq(se)) {
+					p = task_of(se);
+					if (check_entangled_cpu_constraint(rq, p))
+						return p;
+				}
+				node = rb_next(node);
+			}
+			/* Also check the current entity if on_rq */
+			if (leaf_cfs_rq->curr && leaf_cfs_rq->curr->on_rq &&
+			    !group_cfs_rq(leaf_cfs_rq->curr)) {
+				p = task_of(leaf_cfs_rq->curr);
+				if (check_entangled_cpu_constraint(rq, p))
+					return p;
+			}
+		}
+	}
+
+	/* No alternative found. Start retry timer. */
+	{
+		struct hrtimer *timer = this_cpu_ptr(&entangled_retry_timer);
+		if (!hrtimer_active(timer))
+			hrtimer_start(timer, ns_to_ktime(ENTANGLED_RETRY_NS),
+				      HRTIMER_MODE_REL_PINNED);
+	}
+	return NULL;
 }
 
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
@@ -13309,6 +13433,98 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
 #endif
 
 /*
+ * Entangled CPU tick check: if this CPU is the active (turn-holding) CPU
+ * and the partner has a blocked task waiting, switch turns after the
+ * turn duration expires. This drives the fair alternation between users.
+ */
+static void check_entangled_tick(struct rq *rq)
+{
+	unsigned int cpu1, cpu2, this_cpu, other_cpu;
+	int other_idx, active;
+	unsigned long turn_start_val;
+
+	cpu1 = READ_ONCE(sysctl_entangled_cpu1);
+	cpu2 = READ_ONCE(sysctl_entangled_cpu2);
+
+	if (cpu1 == cpu2)
+		return;
+
+	this_cpu = cpu_of(rq);
+
+	if (this_cpu == cpu1) {
+		other_cpu = cpu2;
+		other_idx = 1;
+	} else if (this_cpu == cpu2) {
+		other_cpu = cpu1;
+		other_idx = 0;
+	} else {
+		return;
+	}
+
+	/* Reset stale state if the entangled CPU pair has changed */
+	active = READ_ONCE(entangled_active_cpu);
+	if (active != -1 && active != (int)cpu1 && active != (int)cpu2) {
+		WRITE_ONCE(entangled_active_cpu, -1);
+		WRITE_ONCE(entangled_wants_to_run[0], false);
+		WRITE_ONCE(entangled_wants_to_run[1], false);
+		WRITE_ONCE(entangled_block_start_jiffies[0], 0);
+		WRITE_ONCE(entangled_block_start_jiffies[1], 0);
+		return;
+	}
+
+	/*
+	 * Cold start: if no turn is assigned yet, check if both CPUs are
+	 * running different-user tasks (conflict). Only cpu1 in the pair
+	 * initiates to avoid races with the other CPU.
+	 */
+	if (active == -1) {
+		struct task_struct *other_task;
+
+		if (this_cpu != cpu1)
+			return;
+
+		other_task = READ_ONCE(cpu_rq(other_cpu)->curr);
+		if (other_task && other_task->mm && other_task->pid != 0 &&
+		    rq->curr && rq->curr->mm && rq->curr->pid != 0) {
+			uid_t this_uid = __kuid_val(task_uid(rq->curr));
+			uid_t other_uid = __kuid_val(task_uid(other_task));
+
+			if (this_uid != other_uid) {
+				/* Give the turn to the other CPU */
+				WRITE_ONCE(entangled_active_cpu, (int)other_cpu);
+				WRITE_ONCE(entangled_turn_start, jiffies);
+				resched_curr(rq);
+			}
+		}
+		return;
+	}
+
+	/* Only the active CPU manages turn switching */
+	if (active != (int)this_cpu)
+		return;
+
+	/* Partner doesn't need the CPU - nothing to do */
+	if (!READ_ONCE(entangled_wants_to_run[other_idx]) &&
+	    !cpu_rq(other_cpu)->cfs.nr_running)
+		return;
+
+	/* Check if our turn has expired */
+	turn_start_val = READ_ONCE(entangled_turn_start);
+	if (time_before(jiffies, turn_start_val + ENTANGLED_TURN_JIFFIES))
+		return;
+
+	/* Turn expired - switch to partner */
+	WRITE_ONCE(entangled_active_cpu, (int)other_cpu);
+	WRITE_ONCE(entangled_turn_start, jiffies);
+
+	/* Wake the partner CPU from idle immediately via IPI */
+	wake_up_nohz_cpu(other_cpu);
+
+	/* Preempt ourselves so we yield */
+	resched_curr(rq);
+}
+
+/*
  * scheduler tick hitting a task of our scheduling class.
  *
  * NOTE: This function can be called remotely by the tick offload that
@@ -13333,6 +13549,9 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	check_update_overutilized_status(task_rq(curr));
 
 	task_tick_core(rq, curr);
+
+	/* Entangled CPU tick: preempt self if partner has a blocked task */
+	check_entangled_tick(rq);
 }
 
 /*
@@ -13950,4 +14169,15 @@ __init void init_sched_fair_class(void)
 #endif
 #endif /* SMP */
 
+	/* Initialize per-CPU entangled retry timers */
+	{
+		int cpu;
+		for_each_possible_cpu(cpu) {
+			struct hrtimer *timer =
+				per_cpu_ptr(&entangled_retry_timer, cpu);
+			hrtimer_init(timer, CLOCK_MONOTONIC,
+				     HRTIMER_MODE_REL_PINNED);
+			timer->function = entangled_retry_fn;
+		}
+	}
 }
